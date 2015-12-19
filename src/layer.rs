@@ -1,10 +1,10 @@
 //! Provides the generics and interfaces for the specific [Layers][layers].
 //! [layers]: ../layers/index.html
 use co::backend::IBackend;
-use co::libraries::blas::IBlas;
-use co::libraries::numeric_helpers::Float;
-use phloem::Blob;
-use shared_memory::{ArcLock, HeapBlob};
+use conn::plugin::INn;
+use co::plugin::numeric_helpers::Float;
+use co::tensor::*;
+use shared_memory::{ArcLock, HeapBlob, Blob};
 use layers::*;
 use std::fmt;
 use std::cmp;
@@ -91,7 +91,7 @@ pub type WriteBlob<'_> = RwLockWriteGuard<'_, HeapBlob>;
 
 #[derive(Debug)]
 /// The generic Layer
-pub struct Layer<B: IBackend + IBlas<f32>> {
+pub struct Layer<B: IBackend + INn<f32>> {
     /// Identifies the Network
     ///
     /// The name is mainly used for logging purposes.
@@ -104,7 +104,7 @@ pub struct Layer<B: IBackend + IBlas<f32>> {
     /// This is the part that does most of the work ([forward][2]/[backward][3]).
     /// [2]: ./trait.ILayer.html#method.forward
     /// [3]: ./trait.ILayer.html#method.backward
-    pub worker: Box<ILayer>,
+    pub worker: Box<ILayer<B>>,
 
     backend: Rc<B>,
 
@@ -131,12 +131,14 @@ pub struct Layer<B: IBackend + IBlas<f32>> {
 
     /// References to all the bottom blobs of the layer.
     pub bottom_blobs: Vec<ArcLock<HeapBlob>>,
-    bottom_blob_names: HashMap<String, (usize, ArcLock<HeapBlob>)>,
+    // bottom_blob_names: HashMap<String, (usize, ArcLock<HeapBlob>)>,
+    bottom_blob_names: Vec<String>,
     bottom_need_backwards: Vec<bool>,
 
     /// References to all the top blobs of the layer.
     pub top_blobs: Vec<ArcLock<HeapBlob>>,
-    top_blob_names: HashMap<String, (usize, ArcLock<HeapBlob>)>,
+    top_blob_names: Vec<String>,
+    // top_blob_names: HashMap<String, (usize, ArcLock<HeapBlob>)>,
 
     /// All the blobs of the layer that can be addressed by name.
     ///
@@ -144,7 +146,7 @@ pub struct Layer<B: IBackend + IBlas<f32>> {
     pub blob_names: HashMap<String, ArcLock<HeapBlob>>,
 }
 
-impl<B: IBackend + IBlas<f32>> Layer<B> {
+impl<B: IBackend + INn<f32>> Layer<B> {
     /// Creates a new Layer from a [LayerConfig][1].
     /// [1]: ./struct.LayerConfig.html
     ///
@@ -160,15 +162,15 @@ impl<B: IBackend + IBlas<f32>> Layer<B> {
             needs_backward: true,
 
             blobs: Vec::new(),
-            loss: Vec::new(),
+            loss: vec![1f32, 1f32, 1f32],
             weight_propagate_down: Vec::new(),
 
             bottom_blobs: Vec::new(),
-            bottom_blob_names: HashMap::new(),
+            bottom_blob_names: Vec::new(),
             bottom_need_backwards: Vec::new(),
 
             top_blobs: Vec::new(),
-            top_blob_names: HashMap::new(),
+            top_blob_names: Vec::new(),
 
             blob_names: HashMap::new(),
 
@@ -183,9 +185,10 @@ impl<B: IBackend + IBlas<f32>> Layer<B> {
     /// [1]: #method.from_config
     /// [2]: ./enum.LayerType.html
     /// [3]: ../layers/index.html
-    fn worker_from_config(config: &LayerConfig) -> Box<ILayer> {
+    fn worker_from_config(config: &LayerConfig) -> Box<ILayer<B>> {
         match config.layer_type {
             LayerType::Sigmoid => Box::new(Sigmoid),
+            LayerType::SoftmaxLoss => Box::new(SoftmaxLoss::default()),
         }
     }
 
@@ -214,6 +217,7 @@ impl<B: IBackend + IBlas<f32>> Layer<B> {
         // specified fewer than the required number (as specified by
         // ExactNumTopBlobs() or MinTopBlobs()), allocate them here.
         let auto_top_blobs = self.worker.auto_top_blobs();
+        debug!("Layer {} - auto_top_blobs: {}", &self.name, &auto_top_blobs);
         let min_top_blobs = self.worker.min_top_blobs();
         let exact_num_top_blobs = self.worker.exact_num_top_blobs();
         if auto_top_blobs {
@@ -222,12 +226,13 @@ impl<B: IBackend + IBlas<f32>> Layer<B> {
                 // Add "anonymous" top blobs -- do not add to registry
                 // as we don't want these blobs to be usable as input
                 // to other layers.
-                info!("Adding anonymous top blob");
+                info!("Adding anonymous top blob for layer {}", &self.name);
                 self.create_anonymous_top();
             }
         }
 
-        self.worker.init();
+        self.worker.init(&self.backend);
+        self.worker.reshape(&self.bottom_blobs, &mut self.top_blobs);
     }
 
     /// Append blob as [bottom blob][1] to the Layer.
@@ -248,9 +253,9 @@ impl<B: IBackend + IBlas<f32>> Layer<B> {
                    self.name,
                    bottom_id);
         }
-        info!("{} <- {}", self.name, blob_name);
+        info!("{:<15} -> {:>15}", blob_name, self.name);
 
-        self.bottom_blob_names.insert(blob_name.to_owned(), (self.bottom_blobs.len(), available_blobs[&*blob_name].clone()));
+        self.bottom_blob_names.push(blob_name.to_owned());
         self.bottom_blobs.push(available_blobs[&*blob_name].clone());
         available_blobs.remove(&*blob_name);
 
@@ -291,13 +296,14 @@ impl<B: IBackend + IBlas<f32>> Layer<B> {
         } else {
             // if (Caffe::root_solver()) {
             {
-                info!("{} -> {}", layer_config.name, blob_name);
+                info!("{:<15} -> {:>15}", self.name, blob_name);
                 info!("Input {} -> {}", top_id, blob_name);
             }
 
-            blob = Arc::new(RwLock::new(Box::new(Blob::new())));
+            let backend: Rc<IBackend<F=B::F>> = self.backend.clone();
+            blob = Arc::new(RwLock::new(Blob::from_data(SharedTensor::new(backend.device(), &vec![1,1,1]).unwrap()))); // [1,1,1] for CUDA
         }
-        self.top_blob_names.insert(blob_name.clone(), (self.top_blobs.len(),blob.clone()));
+        self.top_blob_names.push(blob_name.clone());
         self.top_blobs.push(blob.clone());
         self.blob_names.insert(blob_name.clone(), blob.clone());
         registry.insert(blob_name.clone(), blob.clone());
@@ -316,7 +322,8 @@ impl<B: IBackend + IBlas<f32>> Layer<B> {
 
         info!("{} -> {}", self.name, blob_name);
 
-        let blob: ArcLock<HeapBlob> = Arc::new(RwLock::new(Box::new(Blob::new())));
+        let backend: Rc<IBackend<F=B::F>> = self.backend.clone();
+        let blob: ArcLock<HeapBlob> = Arc::new(RwLock::new(Blob::from_data(SharedTensor::new(backend.device(), &vec![1,1,1]).unwrap()))); // [1,1,1] for CUDA
         self.top_blobs.push(blob);
     }
 
@@ -334,14 +341,14 @@ impl<B: IBackend + IBlas<f32>> Layer<B> {
         let mut layer_contributes_loss = false;
         let mut layer_skip_propagate_down = true;
         for (top_id, top_blob) in self.top_blobs.iter().enumerate() {
-            let blob_name = self.name_for_blob(top_blob);
+            let blob_name = self.top_blob_names.get(top_id);
 
             // layer is a loss layer or under a loss layer
-            if self.loss(top_id).is_some() || blobs_under_loss.contains(blob_name) {
+            if self.loss(top_id).is_some() || blob_name.is_some() && blobs_under_loss.contains(blob_name.unwrap()) {
                 layer_contributes_loss = true;
             }
             // layer is not marked to skip backpropagation
-            if !blobs_skip_backp.contains(blob_name) {
+            if blob_name.is_none() || blob_name.is_some() && !blobs_skip_backp.contains(blob_name.unwrap()) {
                 layer_skip_propagate_down = false;
             }
             // layer contributes loss to some
@@ -369,7 +376,7 @@ impl<B: IBackend + IBlas<f32>> Layer<B> {
                   self.needs_backward);
         }
 
-        for (bottom_name, (bottom_id, _)) in self.bottom_blob_names.clone() {
+        for (bottom_id, bottom_name) in self.bottom_blob_names.iter().enumerate() {
             if layer_contributes_loss {
                 blobs_under_loss.insert(bottom_name.clone());
             } else {
@@ -403,7 +410,7 @@ impl<B: IBackend + IBlas<f32>> Layer<B> {
     ///
     /// See [ILayer.forward](./trait.ILayer.html#method.forward)
     pub fn forward(&mut self) -> f32 {
-        self.worker.forward(&self.bottom_blobs, &mut self.top_blobs)
+        self.worker.forward(&self.backend, &self.bottom_blobs, &mut self.top_blobs)
     }
 
     /// Uses the underlying layer implementation to compute a backward step.
@@ -411,7 +418,7 @@ impl<B: IBackend + IBlas<f32>> Layer<B> {
     /// See [ILayer.backward](./trait.ILayer.html#method.backward)
     pub fn backward(&mut self) {
         if self.needs_backward {
-            self.worker.backward(&self.top_blobs, &self.bottom_need_backwards, &mut self.bottom_blobs)
+            self.worker.backward(&self.backend, &self.top_blobs, &self.bottom_need_backwards, &mut self.bottom_blobs)
         }
     }
 
@@ -434,34 +441,33 @@ impl<B: IBackend + IBlas<f32>> Layer<B> {
     pub fn loss(&self, weight_id: usize) -> Option<&f32> {
         self.loss.get(weight_id)
     }
-
-    /// Find the name for a supplied blob.
-    fn name_for_blob(&self, blob: &ArcLock<HeapBlob>) -> &str {
-        // let (res, _) = self.blob_names.iter().find(|&(_, b)| blob == b).unwrap();
-        //
-        // res
-        unimplemented!();
-    }
 }
 
 /// A Layer in a [Neural Network][1] that can handle forward and backward of a computation step.
 /// [1]: ../network/index.html
-pub trait ILayer {
+pub trait ILayer<B: IBackend> {
     /// Initialize the layer for computation.
     ///
     /// Allows for layer-specific one time setup, e.g. precomputing constant values.
     ///
-    /// Is called during [Network][1] initalization
+    /// Is called during [Network][1] initalization.
     /// [1]: ../network/type.Network.html
-    fn init(&mut self) {}
+    fn init(&mut self, backend: &Rc<B>) {}
+
+    /// Adjust to shapes of the top blobs to fit the shapes of the bottom blobs.
+    ///
+    /// Is called during [Network][1] initalization, after [init][2].
+    /// [1]: ../network/type.Network.html
+    /// [2]: #method.init
+    fn reshape(&mut self, bottom: &[ArcLock<HeapBlob>], top: &mut Vec<ArcLock<HeapBlob>>) {}
 
     /// Compute the [feedforward][1] layer output.
     /// [1]: https://en.wikipedia.org/wiki/Feedforward_neural_network
-    fn forward_layer(&self, bottom: &[ReadBlob], top: &mut Vec<&mut WriteBlob>);
+    fn forward_layer(&self, backend: &B, bottom: &[ReadBlob], top: &mut Vec<&mut WriteBlob>);
     /// Compute the gradients for the bottom blobs
     /// if the corresponding value of `propagate_down` is true.
     /// Uses the CPU.
-    fn backward_layer(&self, top: &[ReadBlob], propagate_down: &[bool], bottom: &mut Vec<&mut WriteBlob>);
+    fn backward_layer(&self, backend: &B, top: &[ReadBlob], propagate_down: &[bool], bottom: &mut Vec<&mut WriteBlob>);
 
     /// Compute the [feedforward][1] layer output using the currently set computation method.
     /// [1]: https://en.wikipedia.org/wiki/Feedforward_neural_network
@@ -474,7 +480,7 @@ pub trait ILayer {
     /// [3]: ./type.WriteBlob.html
     /// [3]: #method.forward_cpu
     #[cfg_attr(lint, allow(map_clone))]
-    fn forward(&self, bottom: &[ArcLock<HeapBlob>], top: &mut Vec<ArcLock<HeapBlob>>) -> f32 {
+    fn forward(&self, backend: &B, bottom: &[ArcLock<HeapBlob>], top: &mut Vec<ArcLock<HeapBlob>>) -> f32 {
         // Lock();
         // Reshape(bottom, top); // Reshape the layer to fit top & bottom blob
         let mut loss = 0f32;
@@ -482,16 +488,18 @@ pub trait ILayer {
         let btm: Vec<_> = bottom.iter().map(|b| b.read().unwrap()).collect();
         let tp_ref = top.iter().cloned().collect::<Vec<_>>();
         let mut tp = &mut tp_ref.iter().map(|b| b.write().unwrap()).collect::<Vec<_>>();
-        let mut top_w = &mut tp.iter_mut().map(|a| a).collect::<Vec<_>>();
-        self.forward_layer(&btm, top_w);
+        {
+            let mut top_w = &mut tp.iter_mut().map(|a| a).collect::<Vec<_>>();
+            self.forward_layer(backend, &btm, top_w);
+        }
 
-        for (top_id, top_layer) in top.iter().enumerate() {
+        for (top_id, top_layer) in tp.iter().enumerate() {
             // if (!this->loss(top_id)) { continue; } // Caffe
             // if !self.loss(top_id) { continue; }
 
-            let top_blob = top_layer.read().unwrap();
+            let top_blob = top_layer;
 
-            let data = top_blob.data();
+            let data = top_blob;
             let loss_weights = top_blob.diff();
 
             // TODO
@@ -514,12 +522,12 @@ pub trait ILayer {
     /// [3]: ./type.WriteBlob.html
     /// [3]: #method.backward_cpu
     #[cfg_attr(lint, allow(map_clone))]
-    fn backward(&self, top: &[ArcLock<HeapBlob>], propagate_down: &[bool], bottom: &mut Vec<ArcLock<HeapBlob>>) {
+    fn backward(&self, backend: &B, top: &[ArcLock<HeapBlob>], propagate_down: &[bool], bottom: &mut Vec<ArcLock<HeapBlob>>) {
         let tp: Vec<_> = top.iter().map(|b| b.read().unwrap()).collect();
         let bt_ref = bottom.iter().cloned().collect::<Vec<_>>();
         let mut bt = &mut bt_ref.iter().map(|b| b.write().unwrap()).collect::<Vec<_>>();
         let mut btm = &mut bt.iter_mut().map(|a| a).collect::<Vec<_>>();
-        self.backward_layer(&tp, propagate_down, btm);
+        self.backward_layer(backend, &tp, propagate_down, btm);
     }
 
     /// Return whether "anonymous" top blobs are created automatically for the layer.
@@ -566,7 +574,7 @@ pub trait ILayer {
     }
 }
 
-impl fmt::Debug for ILayer {
+impl<B: IBackend> fmt::Debug for ILayer<B> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "({}, {})", "foo", "bar")
     }
@@ -600,6 +608,8 @@ pub struct LayerConfig {
 pub enum LayerType {
     /// Sigmoid Layer
     Sigmoid,
+    /// SoftmaxLoss Layer
+    SoftmaxLoss,
 }
 
 impl LayerConfig {
@@ -719,7 +729,7 @@ impl WeightConfig {
         match self.share_mode {
             // Permissive dimension checking -- only check counts are the same.
             DimCheckMode::Permissive => {
-                if blob_one.capacity() != blob_two.capacity() {
+                if blob_one.size() != blob_two.size() {
                     return Err(format!("Cannot share weight '{}' owned by layer '{}' with layer '{}';
                                 count mismatch.
                                 Owner layer weight shape is {};

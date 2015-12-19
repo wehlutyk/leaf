@@ -12,38 +12,39 @@
 //! * can be computed faster
 //! * is therefore the most popular activation function in DNNs as of this
 //! writing (2015).
+use co::backend::IBackend;
+use co::tensor::SharedTensor;
+use conn::plugin::INn;
 use layer::*;
+use shared_memory::*;
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Copy, Clone)]
 /// Sigmoid Activation Layer
 pub struct Sigmoid;
 
-impl ILayer for Sigmoid {
+impl<B: IBackend + INn<f32>> ILayer<B> for Sigmoid {
     impl_ilayer_activation!();
 
-    fn forward_layer(&self, bottom: &[ReadBlob], top: &mut Vec<&mut WriteBlob>) {
+    fn reshape(&mut self, bottom: &[ArcLock<HeapBlob>], top: &mut Vec<ArcLock<HeapBlob>>) {
+        let btm = bottom[0].read().unwrap();
+        top[0] = Arc::new(RwLock::new(Blob::from_data(SharedTensor::<f32>::new(btm.data().latest_device(), btm.shape()).unwrap())));
+    }
+
+    fn forward_layer(&self, backend: &B, bottom: &[ReadBlob], top: &mut Vec<&mut WriteBlob>) {
         let bottom_data = bottom[0].data();
         let top_data = top[0].mut_data();
 
-        // TODO
-        // for (i, _) in bottom_data.iter().enumerate() {
-        //     top_data[i] = Sigmoid::sigmoid(bottom_data[i])
-        // }
+        backend.sigmoid_plain(bottom_data, top_data).unwrap();
+        debug!("SIGMOID HERE");
     }
 
-    fn backward_layer(&self, top: &[ReadBlob], propagate_down: &[bool], bottom: &mut Vec<&mut WriteBlob>) {
+    fn backward_layer(&self, backend: &B, top: &[ReadBlob], propagate_down: &[bool], bottom: &mut Vec<&mut WriteBlob>) {
         if propagate_down[0] {
-            let top_data = top[0].data();
-            let top_diff = top[0].diff();
-            let count = bottom[0].capacity();
-            let bottom_diff = bottom[0].mut_diff();
-
-
-            // for i in 0..count {
-                // TODO
-                // let sigmoid_x = top_data[i];
-                // bottom_diff[i] = top_diff[i] * Sigmoid::sigmoid_prime_precalc(sigmoid_x)
-            // }
+            let _ = backend.sigmoid_grad_plain(top[0].data(),
+                                               top[0].diff(),
+                                               top[0].data(),
+                                               bottom[0].mut_diff());
         }
     }
 }

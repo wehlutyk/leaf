@@ -33,13 +33,15 @@
 //! The blobs in a input layer contain externally preprocessed data that has
 //! been brought into a form suitable for consumption by a neural network.
 use co::backend::IBackend;
-use co::libraries::blas::IBlas;
+use co::tensor::*;
+use coblas::plugin::IBlas;
+use conn::plugin::INn;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use shared_memory::*;
 use layer::{ILayer, Layer};
 use layer::{LayerConfig, WeightConfig};
-use phloem::Blob;
+// use phloem::Blob;
 use std::rc::Rc;
 
 #[derive(Debug)]
@@ -55,7 +57,7 @@ use std::rc::Rc;
 /// A Network is usually used together with a [Solver][6] to optimize the networks' weights.
 ///
 /// [6]: ../solver/struct.Solver.html
-pub struct Network<B: IBackend + IBlas<f32>> {
+pub struct Network<B: IBackend + INn<f32>> {
     /// Identifies the Network
     ///
     /// The name is mainly used for logging purposes.
@@ -86,7 +88,7 @@ pub struct Network<B: IBackend + IBlas<f32>> {
     weights_weight_decay: Vec<Option<f32>>,
 }
 
-impl<B: IBackend + IBlas<f32>> Default for Network<B> {
+impl<B: IBackend + INn<f32>> Default for Network<B> {
     fn default() -> Network<B> {
         Network {
             name: "".to_owned(),
@@ -113,7 +115,7 @@ impl<B: IBackend + IBlas<f32>> Default for Network<B> {
     }
 }
 
-impl<B: IBackend + IBlas<f32>> Network<B> {
+impl<B: IBackend + INn<f32>> Network<B> {
     /// Creates a Network from a [NetworkConfig][1].
     /// [1]: ./struct.NetworkConfig.html
     ///
@@ -158,7 +160,7 @@ impl<B: IBackend + IBlas<f32>> Network<B> {
         let registry = &mut HashMap::<String, ArcLock<HeapBlob>>::new();
 
         for (input_name, input_shape) in config.inputs.iter().zip(config.input_shapes.iter()) {
-            self.init_input_blob(&input_name, input_shape, registry);
+            self.init_input_blob(backend.clone(), &input_name, input_shape, registry);
         }
 
         for layer_config in &config.layers {
@@ -173,7 +175,7 @@ impl<B: IBackend + IBlas<f32>> Network<B> {
         // computation for the entire layer
         let blobs_under_loss = &mut HashSet::<String>::new();
         let blobs_skip_backp = &mut HashSet::<String>::new();
-        for layer in &mut self.layers {
+        for layer in &mut self.layers.iter_mut().rev() {
             layer.init_backprop( blobs_under_loss, blobs_skip_backp);
         }
 
@@ -226,7 +228,6 @@ impl<B: IBackend + IBlas<f32>> Network<B> {
         let mut layer = Layer::from_config(backend, &layer_config);
 
         // Figure out this layer's input and output
-        // self.layers.last_mut().unwrap().connect(registry);
         layer.connect(registry);
 
         for (weight_id, _) in layer.blobs.iter().enumerate() {
@@ -251,8 +252,8 @@ impl<B: IBackend + IBlas<f32>> Network<B> {
         // }
         for (i, _) in self.weights.clone().iter().enumerate() {
             if let Some(j) = self.weight_owners[i] {
-                assert!(self.weights[i].read().unwrap().capacity() ==
-                        self.weights[j].read().unwrap().capacity());
+                assert!(self.weights[i].read().unwrap().size() ==
+                        self.weights[j].read().unwrap().size());
                 self.weights[i] = self.weights[j].clone(); // sharing whole blob?
             }
         }
@@ -268,6 +269,7 @@ impl<B: IBackend + IBlas<f32>> Network<B> {
     /// [2]: ../layer/struct.Layer.html#method.connect
     #[cfg_attr(lint, allow(ptr_arg))]
     fn init_input_blob(&mut self,
+                  backend: Rc<B>,
                   blob_name: &str,
                   input_shape: &Vec<usize>,
                   registry: &mut HashMap<String, ArcLock<HeapBlob>>) {
@@ -283,14 +285,11 @@ impl<B: IBackend + IBlas<f32>> Network<B> {
                 info!("Input {} -> {}", self.input_blobs.len(), blob_name);
             }
 
-            let blob: ArcLock<HeapBlob> = Arc::new(RwLock::new(Box::new(Blob::new())));
+            let ibackend: Rc<IBackend<F=B::F>> = backend;
+            let blob: ArcLock<HeapBlob> = Arc::new(RwLock::new(HeapBlob::from_data(SharedTensor::new(ibackend.device(), input_shape).unwrap())));
             let blob_id = self.blobs.len();
             self.blobs.push(blob.clone());
             self.blob_names.push(blob_name.to_owned());
-
-            // Set the (explicitly specified) dimensions of the input blob.
-            // let input_shape = config.input_shape(top_id).unwrap().clone();
-            blob.write().unwrap().reshape(&input_shape.clone());
 
             self.input_blobs.push(blob.clone());
             registry.insert(blob_name.to_owned(), blob);
@@ -307,6 +306,7 @@ impl<B: IBackend + IBlas<f32>> Network<B> {
     /// [1]: ../layer/struct.LayerConfig.html
     fn append_weight(&mut self, layer_id: usize, weight_id: usize) {
         let layer_config = self.layers[layer_id].config.clone();
+        info!("Appending weight to layer {}", &layer_config.name);
         let weights_len = self.weights.len();
         let weight_name = if weights_len > weight_id {
             layer_config.param(weight_id).unwrap().name.clone()
@@ -530,6 +530,37 @@ impl<B: IBackend + IBlas<f32>> Network<B> {
         }
     }
 
+    // /// Updates the [weights][1] with the weight update computed by the [Solver][2].
+    // /// [1]: https://en.wikipedia.org/wiki/Synaptic_weight
+    // /// [2]: ../solver/struct.Solver.html
+    // ///
+    // /// Updating the weights is the last step of computing a [Solver][2] minibatch.
+    // /// The update value is computed in previous steps according to the [learning rate policy][3]
+    // ///
+    // /// [3]: ../solver/enum.LRPolicy.html
+    // pub fn update_weights<SolverB: IBackend + IBlas<f32>>(&mut self, backend: &SolverB) {
+    //     for weight_blob in &self.learnable_weights {
+    //         weight_blob.write().unwrap().apply_diff(backend)
+    //     }
+    // }
+    //
+    // #[allow(missing_docs)]
+    // pub fn learnable_weights(&self) -> &Vec<ArcLock<HeapBlob>> {
+    //     &self.learnable_weights
+    // }
+    //
+    // #[allow(missing_docs)]
+    // pub fn weights_weight_decay(&self) -> &Vec<Option<f32>> {
+    //     &self.weights_weight_decay
+    // }
+    //
+    // #[allow(missing_docs)]
+    // pub fn weights_lr(&self) -> &Vec<Option<f32>> {
+    //     &self.weights_lr
+    // }
+}
+
+impl<B: IBackend + INn<f32>> Network<B> {
     /// Updates the [weights][1] with the weight update computed by the [Solver][2].
     /// [1]: https://en.wikipedia.org/wiki/Synaptic_weight
     /// [2]: ../solver/struct.Solver.html
@@ -538,9 +569,9 @@ impl<B: IBackend + IBlas<f32>> Network<B> {
     /// The update value is computed in previous steps according to the [learning rate policy][3]
     ///
     /// [3]: ../solver/enum.LRPolicy.html
-    pub fn update_weights(&mut self) {
+    pub fn update_weights<SolverB: IBackend + IBlas<f32>>(&mut self, backend: &SolverB) {
         for weight_blob in &self.learnable_weights {
-            weight_blob.write().unwrap().apply_diff()
+            weight_blob.write().unwrap().apply_diff(backend)
         }
     }
 
